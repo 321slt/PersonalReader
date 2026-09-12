@@ -1,0 +1,399 @@
+name: Build Personal Reader Android
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'PersonalReader-Android-v4.11.zip'
+      - '.github/workflows/build-android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install stable Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Extract web application from Android archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s PersonalReader-Android-v4.11.zip
+          rm -rf extracted android-project
+          mkdir -p extracted android-project
+          unzip -q PersonalReader-Android-v4.11.zip -d extracted
+
+          ASSET_DIR="$(find extracted -type d -path '*/app/src/main/assets' -print -quit)"
+          if [[ -z "${ASSET_DIR}" ]]; then
+            echo "ERROR: app/src/main/assets was not found in the archive."
+            find extracted -maxdepth 8 -type f | sort
+            exit 1
+          fi
+
+          if [[ -f "${ASSET_DIR}/index.html" ]]; then
+            ENTRY_REL="index.html"
+          else
+            ENTRY="$(find "${ASSET_DIR}" -type f \( -name 'index.html' -o -name '*.html' \) -print -quit)"
+            if [[ -z "${ENTRY}" ]]; then
+              echo "ERROR: No HTML entry point exists in app/src/main/assets."
+              find "${ASSET_DIR}" -maxdepth 3 -type f | sort
+              exit 1
+            fi
+            ENTRY_REL="${ENTRY#${ASSET_DIR}/}"
+          fi
+
+          mkdir -p android-project/app/src/main/assets
+          cp -a "${ASSET_DIR}/." android-project/app/src/main/assets/
+          echo "ENTRY_REL=${ENTRY_REL}" >> "$GITHUB_ENV"
+          echo "Android web entry: ${ENTRY_REL}"
+
+      - name: Generate clean Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android-project/app/src/main/java/com/personalreader/app
+          mkdir -p android-project/app/src/main/res/values
+
+          cat > android-project/settings.gradle.kts <<'SETTINGS'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(org.gradle.api.initialization.resolve.RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "PersonalReader"
+          include(":app")
+          SETTINGS
+
+          cat > android-project/build.gradle.kts <<'ROOT'
+          plugins {
+              id("com.android.application") version "9.4.0" apply false
+          }
+          ROOT
+
+          cat > android-project/gradle.properties <<'PROPS'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          PROPS
+
+          cat > android-project/app/build.gradle.kts <<'APP'
+          plugins {
+              id("com.android.application")
+          }
+
+          android {
+              namespace = "com.personalreader.app"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.personalreader.app"
+                  minSdk = 26
+                  targetSdk = 36
+                  versionCode = 411
+                  versionName = "4.11.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          APP
+
+          cat > android-project/app/src/main/res/values/strings.xml <<'STRINGS'
+          <resources>
+              <string name="app_name">Personal Reader</string>
+          </resources>
+          STRINGS
+
+          cat > android-project/app/src/main/AndroidManifest.xml <<'MANIFEST'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:resizeableActivity="true"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          MANIFEST
+
+          # Generate a deliberately dependency-free Activity.  This avoids the
+          # AndroidX WebKit/annotation symbols that caused the previous Java
+          # compilation failures while retaining the complete web application.
+          cat > android-project/app/src/main/java/com/personalreader/app/MainActivity.java <<'JAVA'
+          package com.personalreader.app;
+
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.view.ViewGroup;
+          import android.webkit.CookieManager;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public final class MainActivity extends Activity {
+              private static final int FILE_CHOOSER_REQUEST = 42011;
+              private static final String START_PAGE = "__ENTRY_REL__";
+
+              private WebView webView;
+              private ValueCallback<Uri[]> pendingFileCallback;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  createWebView();
+              }
+
+              private void createWebView() {
+                  webView = new WebView(this);
+                  webView.setLayoutParams(new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT));
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setBuiltInZoomControls(false);
+                  settings.setDisplayZoomControls(false);
+                  settings.setSupportZoom(false);
+                  settings.setLoadsImagesAutomatically(true);
+                  settings.setJavaScriptCanOpenWindowsAutomatically(false);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+
+                  CookieManager.getInstance().setAcceptCookie(true);
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri uri = request.getUrl();
+                          String scheme = uri.getScheme();
+                          if (scheme == null || "file".equalsIgnoreCase(scheme)) {
+                              return false;
+                          }
+                          if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+                              try {
+                                  startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                                  return true;
+                              } catch (ActivityNotFoundException ignored) {
+                                  return false;
+                              }
+                          }
+                          return true;
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+                          view.evaluateJavascript(
+                                  "document.documentElement.dataset.androidApp='true';", null);
+                      }
+
+                      @Override
+                      public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                          if (view == webView) {
+                              view.destroy();
+                              createWebView();
+                          }
+                          return true;
+                      }
+                  });
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(
+                              WebView view,
+                              ValueCallback<Uri[]> filePathCallback,
+                              FileChooserParams fileChooserParams) {
+                          if (pendingFileCallback != null) {
+                              pendingFileCallback.onReceiveValue(null);
+                          }
+                          pendingFileCallback = filePathCallback;
+
+                          Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                          intent.addCategory(Intent.CATEGORY_OPENABLE);
+                          intent.setType("*/*");
+                          intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                          intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+                                  "application/epub+zip",
+                                  "application/pdf",
+                                  "text/plain",
+                                  "text/markdown",
+                                  "text/html",
+                                  "application/xhtml+xml",
+                                  "application/zip",
+                                  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                  "application/octet-stream"
+                          });
+
+                          try {
+                              startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+                              return true;
+                          } catch (ActivityNotFoundException e) {
+                              pendingFileCallback.onReceiveValue(null);
+                              pendingFileCallback = null;
+                              return false;
+                          }
+                      }
+                  });
+
+                  webView.loadUrl("file:///android_asset/" + START_PAGE);
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode != FILE_CHOOSER_REQUEST || pendingFileCallback == null) {
+                      return;
+                  }
+
+                  Uri[] results = null;
+                  if (resultCode == RESULT_OK && data != null) {
+                      if (data.getClipData() != null) {
+                          int count = data.getClipData().getItemCount();
+                          results = new Uri[count];
+                          for (int i = 0; i < count; i++) {
+                              results[i] = data.getClipData().getItemAt(i).getUri();
+                          }
+                      } else if (data.getData() != null) {
+                          results = new Uri[] { data.getData() };
+                      }
+                  }
+
+                  pendingFileCallback.onReceiveValue(results);
+                  pendingFileCallback = null;
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (pendingFileCallback != null) {
+                      pendingFileCallback.onReceiveValue(null);
+                      pendingFileCallback = null;
+                  }
+                  if (webView != null) {
+                      webView.stopLoading();
+                      webView.destroy();
+                      webView = null;
+                  }
+                  super.onDestroy();
+              }
+          }
+          JAVA
+
+          # Substitute the real entry path without introducing Java annotations
+          # or shell interpolation into the generated source.
+          ENTRY_REL="$ENTRY_REL" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("android-project/app/src/main/java/com/personalreader/app/MainActivity.java")
+          text = path.read_text(encoding="utf-8")
+          entry = os.environ["ENTRY_REL"].replace("\\", "/").replace('"', '\\"')
+          path.write_text(text.replace("__ENTRY_REL__", entry), encoding="utf-8")
+          PY
+
+      - name: Validate generated Android project
+        shell: bash
+        working-directory: android-project
+        run: |
+          set -euo pipefail
+          test -f settings.gradle.kts
+          test -f build.gradle.kts
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          test -f app/src/main/java/com/personalreader/app/MainActivity.java
+          test -s "app/src/main/assets/${ENTRY_REL}"
+          grep -q 'package com.personalreader.app;' app/src/main/java/com/personalreader/app/MainActivity.java
+          grep -q 'START_PAGE' app/src/main/java/com/personalreader/app/MainActivity.java
+          grep -q 'compileSdk = 36' app/build.gradle.kts
+          grep -q 'targetSdk = 36' app/build.gradle.kts
+
+      - name: Install Gradle 9.6.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://services.gradle.org/distributions/gradle-9.6.0-bin.zip -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle"
+          echo "$RUNNER_TEMP/gradle/gradle-9.6.0/bin" >> "$GITHUB_PATH"
+          gradle --version
+
+      - name: Build debug APK
+        working-directory: android-project
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK
+        working-directory: android-project
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          file app/build/outputs/apk/debug/app-debug.apk
+          ls -lh app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalReader-debug-apk
+          path: android-project/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
