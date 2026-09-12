@@ -1,0 +1,135 @@
+name: Build Personal Reader Android 4.12.4
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'PersonalReader-Android-4.12.4-logo-final.zip'
+      - '.github/workflows/build-android-4.12.4.yml'
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '17'
+  ANDROID_API: '36'
+  BUILD_TOOLS: '36.0.0'
+  GRADLE_VERSION: '9.6.0'
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS}"
+
+      - name: Locate and extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE='PersonalReader-Android-4.12.4-logo-final.zip'
+          test -s "$ARCHIVE"
+          unzip -tq "$ARCHIVE"
+          rm -rf extracted android-project
+          mkdir -p extracted
+          unzip -q "$ARCHIVE" -d extracted
+          PROJECT_DIR="$(find extracted -type f -name settings.gradle.kts -print -quit | xargs -r dirname)"
+          test -n "$PROJECT_DIR"
+          test -f "$PROJECT_DIR/app/build.gradle.kts"
+          test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Pre-build validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$PROJECT_DIR/app/src/main/assets/www/index.html"
+          test -s "$PROJECT_DIR/app/src/main/assets/www/icons/icon.svg"
+          test -s "$PROJECT_DIR/app/src/main/assets/www/icons/icon-192.png"
+          test -s "$PROJECT_DIR/app/src/main/assets/www/icons/icon-512.png"
+          test -s "$PROJECT_DIR/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml"
+          test -s "$PROJECT_DIR/app/src/main/res/drawable/ic_logo_monochrome.xml"
+          grep -q 'android:icon="@mipmap/ic_launcher"' "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          grep -q 'android:roundIcon="@mipmap/ic_launcher_round"' "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          grep -q '<monochrome android:drawable="@drawable/ic_logo_monochrome"' "$PROJECT_DIR/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml"
+          ! grep -R -q '__ENTRY_REL__' "$PROJECT_DIR/app/src/main"
+          ! grep -R -q 'personalreader-v4.12.3' "$PROJECT_DIR/app/src/main/assets/www"
+          grep -q 'versionCode = 4124' "$PROJECT_DIR/app/build.gradle.kts"
+          grep -q 'versionName = "4.12.4"' "$PROJECT_DIR/app/build.gradle.kts"
+          grep -q 'private static final int VERSION_CODE = 4124' "$PROJECT_DIR/app/src/main/java/com/personalreader/app/MainActivity.java"
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          import os
+          p=Path(os.environ['PROJECT_DIR'])
+          ET.parse(p/'app/src/main/AndroidManifest.xml')
+          ET.parse(p/'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml')
+          ET.parse(p/'app/src/main/res/drawable/ic_logo_monochrome.xml')
+          print('XML validation: OK')
+          PY
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Run web regression tests
+        working-directory: ${{ env.PROJECT_DIR }}/app/src/main/assets/www
+        run: |
+          set -euo pipefail
+          node tests/regression.mjs
+          node tests/overlay-position.mjs
+
+      - name: Install Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle"
+          echo "$RUNNER_TEMP/gradle/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          gradle --version
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          file "$APK"
+          ls -lh "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: PersonalReader-debug-apk-4.12.4
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          compression-level: 0
